@@ -1,6 +1,7 @@
 package bench
 
 import (
+	"context"
 	"math"
 	"sync"
 	"time"
@@ -36,10 +37,13 @@ func (r *RateLimiter) Rate() float64 {
 	return math.Log(2) / r.halfLife.Seconds() * r.threshold
 }
 
-// Wait blocks until the caller is allowed to proceed, then increments the load counter.
-// Uses a two-phase lock: compute sleep duration under lock, sleep outside lock,
-// then re-acquire to finalize the increment.
-func (r *RateLimiter) Wait() {
+// Wait blocks until the caller is allowed to proceed, then increments the load
+// counter. Returns ctx.Err() immediately if the context is cancelled while
+// waiting — the caller should treat a non-nil return as a signal to stop.
+//
+// Uses a two-phase lock: compute sleep duration under lock, sleep outside lock
+// (so other goroutines can proceed), then re-acquire to finalize the increment.
+func (r *RateLimiter) Wait(ctx context.Context) error {
 	r.mu.Lock()
 
 	now := time.Now()
@@ -60,7 +64,11 @@ func (r *RateLimiter) Wait() {
 	r.mu.Unlock()
 
 	if sleepDur > 0 {
-		time.Sleep(sleepDur)
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(sleepDur):
+		}
 	}
 
 	// Re-acquire, re-decay from the new moment, then commit the increment.
@@ -73,4 +81,5 @@ func (r *RateLimiter) Wait() {
 	r.load++
 	r.lastTime = now2
 	r.mu.Unlock()
+	return nil
 }

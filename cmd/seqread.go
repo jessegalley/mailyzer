@@ -69,6 +69,11 @@ func runSeqread(cmd *cobra.Command, args []string) error {
 		return err
 	}
 
+	fetchOpts, err := buildFetchOptions(flagFetchMode)
+	if err != nil {
+		return err
+	}
+
 	numUsers := len(boxes)
 	adjustedHalfLife := flagHalfLife * time.Duration(numUsers)
 	rl := bench.NewRateLimiter(adjustedHalfLife, flagThreshold)
@@ -77,8 +82,13 @@ func runSeqread(cmd *cobra.Command, args []string) error {
 	ctx, cancel := context.WithTimeout(context.Background(), flagDuration)
 	defer cancel()
 
-	fmt.Fprintf(os.Stdout, "seqread: host=%s users=%d concurrency=%d page-size=%d duration=%s target=%.2f/s\n",
-		host, numUsers, flagConcurrency, flagPageSize, flagDuration, rl.Rate()*float64(numUsers))
+	if flagNoLimit {
+		fmt.Fprintf(os.Stdout, "seqread: host=%s users=%d concurrency=%d page-size=%d fetch=%s duration=%s (no rate limit)\n",
+			host, numUsers, flagConcurrency, flagPageSize, flagFetchMode, flagDuration)
+	} else {
+		fmt.Fprintf(os.Stdout, "seqread: host=%s users=%d concurrency=%d page-size=%d fetch=%s duration=%s target=%.2f/s\n",
+			host, numUsers, flagConcurrency, flagPageSize, flagFetchMode, flagDuration, rl.Rate()*float64(numUsers))
+	}
 
 	var wg sync.WaitGroup
 
@@ -87,7 +97,7 @@ func runSeqread(cmd *cobra.Command, args []string) error {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			seqreadUserSession(ctx, cfg, mb, rl, m, flagConcurrency, flagPageSize)
+			seqreadUserSession(ctx, cfg, mb, rl, m, flagConcurrency, flagPageSize, flagNoLimit, fetchOpts)
 		}()
 	}
 
@@ -118,6 +128,8 @@ func seqreadUserSession(
 	rl *bench.RateLimiter,
 	m *bench.Metrics,
 	concurrency, pageSize int,
+	noLimit bool,
+	fetchOpts *imap.FetchOptions,
 ) {
 	client, selectData, err := connectAndLogin(cfg, mb)
 	if err != nil {
@@ -141,7 +153,7 @@ func seqreadUserSession(
 		innerWg.Add(1)
 		go func() {
 			defer innerWg.Done()
-			seqreadLoop(ctx, client, ps, rl, m, cfg.cmdTimeout)
+			seqreadLoop(ctx, client, ps, rl, m, cfg.cmdTimeout, noLimit, fetchOpts)
 		}()
 	}
 	innerWg.Wait()
@@ -160,6 +172,8 @@ func seqreadLoop(
 	rl *bench.RateLimiter,
 	m *bench.Metrics,
 	cmdTimeout time.Duration,
+	noLimit bool,
+	fetchOpts *imap.FetchOptions,
 ) {
 	for {
 		select {
@@ -168,7 +182,11 @@ func seqreadLoop(
 		default:
 		}
 
-		rl.Wait()
+		if !noLimit {
+			if err := rl.Wait(ctx); err != nil {
+				return
+			}
+		}
 
 		select {
 		case <-ctx.Done():
@@ -180,10 +198,6 @@ func seqreadLoop(
 
 		var seqSet imap.SeqSet
 		seqSet.AddRange(startSeq, endSeq)
-
-		fetchOpts := &imap.FetchOptions{
-			BodySection: []*imap.FetchItemBodySection{{Peek: true}},
-		}
 
 		done := make(chan fetchResult, 1)
 		t0 := time.Now()

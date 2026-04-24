@@ -36,6 +36,11 @@ func runRandread(cmd *cobra.Command, args []string) error {
 		return err
 	}
 
+	fetchOpts, err := buildFetchOptions(flagFetchMode)
+	if err != nil {
+		return err
+	}
+
 	numUsers := len(boxes)
 	adjustedHalfLife := flagHalfLife * time.Duration(numUsers)
 	rl := bench.NewRateLimiter(adjustedHalfLife, flagThreshold)
@@ -44,8 +49,13 @@ func runRandread(cmd *cobra.Command, args []string) error {
 	ctx, cancel := context.WithTimeout(context.Background(), flagDuration)
 	defer cancel()
 
-	fmt.Fprintf(os.Stdout, "randread: host=%s users=%d concurrency=%d duration=%s target=%.2f/s\n",
-		host, numUsers, flagConcurrency, flagDuration, rl.Rate()*float64(numUsers))
+	if flagNoLimit {
+		fmt.Fprintf(os.Stdout, "randread: host=%s users=%d concurrency=%d fetch=%s duration=%s (no rate limit)\n",
+			host, numUsers, flagConcurrency, flagFetchMode, flagDuration)
+	} else {
+		fmt.Fprintf(os.Stdout, "randread: host=%s users=%d concurrency=%d fetch=%s duration=%s target=%.2f/s\n",
+			host, numUsers, flagConcurrency, flagFetchMode, flagDuration, rl.Rate()*float64(numUsers))
+	}
 
 	var wg sync.WaitGroup
 
@@ -54,7 +64,7 @@ func runRandread(cmd *cobra.Command, args []string) error {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			randreadUserSession(ctx, cfg, mb, rl, m, flagConcurrency)
+			randreadUserSession(ctx, cfg, mb, rl, m, flagConcurrency, flagNoLimit, fetchOpts)
 		}()
 	}
 
@@ -85,6 +95,8 @@ func randreadUserSession(
 	rl *bench.RateLimiter,
 	m *bench.Metrics,
 	concurrency int,
+	noLimit bool,
+	fetchOpts *imap.FetchOptions,
 ) {
 	client, selectData, err := connectAndLogin(cfg, mb)
 	if err != nil {
@@ -106,7 +118,7 @@ func randreadUserSession(
 		innerWg.Add(1)
 		go func() {
 			defer innerWg.Done()
-			randreadLoop(ctx, client, exists, rl, m, cfg.cmdTimeout, seed)
+			randreadLoop(ctx, client, exists, rl, m, cfg.cmdTimeout, seed, noLimit, fetchOpts)
 		}()
 	}
 	innerWg.Wait()
@@ -120,6 +132,8 @@ func randreadLoop(
 	m *bench.Metrics,
 	cmdTimeout time.Duration,
 	seed int64,
+	noLimit bool,
+	fetchOpts *imap.FetchOptions,
 ) {
 	rng := rand.New(rand.NewSource(seed)) //nolint:gosec
 
@@ -130,7 +144,11 @@ func randreadLoop(
 		default:
 		}
 
-		rl.Wait()
+		if !noLimit {
+			if err := rl.Wait(ctx); err != nil {
+				return
+			}
+		}
 
 		select {
 		case <-ctx.Done():
@@ -142,10 +160,6 @@ func randreadLoop(
 
 		var seqSet imap.SeqSet
 		seqSet.AddNum(seqNum)
-
-		fetchOpts := &imap.FetchOptions{
-			BodySection: []*imap.FetchItemBodySection{{Peek: true}},
-		}
 
 		type randResult struct {
 			bytes int64

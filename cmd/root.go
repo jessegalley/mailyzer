@@ -25,6 +25,8 @@ var (
 	flagTimeout     time.Duration
 	flagHalfLife    time.Duration
 	flagThreshold   float64
+	flagNoLimit     bool
+	flagFetchMode   string
 )
 
 var rootCmd = &cobra.Command{
@@ -53,6 +55,8 @@ func init() {
 	pf.DurationVar(&flagTimeout, "timeout", 30*time.Second, "per-command IMAP timeout")
 	pf.DurationVar(&flagHalfLife, "half-life", 1*time.Second, "rate limiter half-life")
 	pf.Float64Var(&flagThreshold, "threshold", 150.0, "rate limiter threshold (rate = ln2/halfLife * threshold)")
+	pf.BoolVar(&flagNoLimit, "no-limit", false, "disable rate limiting (run as fast as possible)")
+	pf.StringVar(&flagFetchMode, "fetch-mode", "all", "what to fetch per message: all, body, headers, envelope")
 }
 
 type connConfig struct {
@@ -114,6 +118,43 @@ func connectAndLogin(cfg connConfig, mb mailbox.Mailbox) (*imapclient.Client, *i
 	}
 
 	return client, selectData, nil
+}
+
+// buildFetchOptions returns the FetchOptions for the given mode:
+//
+//	all      — BODY.PEEK[]             full message bytes (headers + body)
+//	body     — BODY.PEEK[TEXT]         body only, no headers
+//	headers  — BODY.PEEK[HEADER]       raw header block only
+//	envelope — ENVELOPE FLAGS RFC822.SIZE  parsed index fields, no body I/O
+func buildFetchOptions(mode string) (*imap.FetchOptions, error) {
+	switch mode {
+	case "all":
+		return &imap.FetchOptions{
+			BodySection: []*imap.FetchItemBodySection{{Peek: true}},
+		}, nil
+	case "body":
+		return &imap.FetchOptions{
+			BodySection: []*imap.FetchItemBodySection{{
+				Peek:      true,
+				Specifier: imap.PartSpecifierText,
+			}},
+		}, nil
+	case "headers":
+		return &imap.FetchOptions{
+			BodySection: []*imap.FetchItemBodySection{{
+				Peek:      true,
+				Specifier: imap.PartSpecifierHeader,
+			}},
+		}, nil
+	case "envelope":
+		return &imap.FetchOptions{
+			Envelope:   true,
+			Flags:      true,
+			RFC822Size: true,
+		}, nil
+	default:
+		return nil, fmt.Errorf("unknown fetch-mode %q: must be one of: all, body, headers, envelope", mode)
+	}
 }
 
 // closeClient logs out and closes the IMAP client connection.
