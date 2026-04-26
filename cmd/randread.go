@@ -2,7 +2,6 @@ package cmd
 
 import (
 	"context"
-	"fmt"
 	"log"
 	"math/rand"
 	"os"
@@ -41,47 +40,24 @@ func runRandread(cmd *cobra.Command, args []string) error {
 		return err
 	}
 
-	numUsers := len(boxes)
-	adjustedHalfLife := flagHalfLife * time.Duration(numUsers)
-	rl := bench.NewRateLimiter(adjustedHalfLife, flagThreshold)
 	m := bench.NewMetrics()
-
 	ctx, cancel := context.WithTimeout(context.Background(), flagDuration)
 	defer cancel()
 
-	if flagNoLimit {
-		fmt.Fprintf(os.Stdout, "randread: host=%s users=%d concurrency=%d fetch=%s duration=%s (no rate limit)\n",
-			host, numUsers, flagConcurrency, flagFetchMode, flagDuration)
-	} else {
-		fmt.Fprintf(os.Stdout, "randread: host=%s users=%d concurrency=%d fetch=%s duration=%s target=%.2f/s\n",
-			host, numUsers, flagConcurrency, flagFetchMode, flagDuration, rl.Rate()*float64(numUsers))
-	}
+	log.Printf("randread: host=%s users=%d concurrency=%d fetch=%s duration=%s",
+		host, len(boxes), flagConcurrency, flagFetchMode, flagDuration)
 
 	var wg sync.WaitGroup
-
 	for i := range boxes {
 		mb := boxes[i]
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			randreadUserSession(ctx, cfg, mb, rl, m, flagConcurrency, flagNoLimit, fetchOpts)
+			randreadUserSession(ctx, cfg, mb, m, flagConcurrency, fetchOpts)
 		}()
 	}
 
-	// Progress ticker
-	go func() {
-		ticker := time.NewTicker(5 * time.Second)
-		defer ticker.Stop()
-		prev := bench.ProgressState{Time: time.Now()}
-		for {
-			select {
-			case <-ctx.Done():
-				return
-			case <-ticker.C:
-				prev = m.PrintProgress(os.Stdout, prev)
-			}
-		}
-	}()
+	go progressTicker(ctx, m)
 
 	wg.Wait()
 	m.PrintSummary(os.Stdout)
@@ -92,10 +68,8 @@ func randreadUserSession(
 	ctx context.Context,
 	cfg connConfig,
 	mb mailbox.Mailbox,
-	rl *bench.RateLimiter,
 	m *bench.Metrics,
 	concurrency int,
-	noLimit bool,
 	fetchOpts *imap.FetchOptions,
 ) {
 	client, selectData, err := connectAndLogin(cfg, mb)
@@ -118,7 +92,7 @@ func randreadUserSession(
 		innerWg.Add(1)
 		go func() {
 			defer innerWg.Done()
-			randreadLoop(ctx, client, exists, rl, m, cfg.cmdTimeout, seed, noLimit, fetchOpts)
+			randreadLoop(ctx, client, exists, m, cfg.cmdTimeout, seed, fetchOpts)
 		}()
 	}
 	innerWg.Wait()
@@ -128,11 +102,9 @@ func randreadLoop(
 	ctx context.Context,
 	client *imapclient.Client,
 	exists uint32,
-	rl *bench.RateLimiter,
 	m *bench.Metrics,
 	cmdTimeout time.Duration,
 	seed int64,
-	noLimit bool,
 	fetchOpts *imap.FetchOptions,
 ) {
 	rng := rand.New(rand.NewSource(seed)) //nolint:gosec
@@ -144,28 +116,16 @@ func randreadLoop(
 		default:
 		}
 
-		if !noLimit {
-			if err := rl.Wait(ctx); err != nil {
-				return
-			}
-		}
-
-		select {
-		case <-ctx.Done():
-			return
-		default:
-		}
-
 		seqNum := uint32(rng.Int63n(int64(exists))) + 1
 
 		var seqSet imap.SeqSet
 		seqSet.AddNum(seqNum)
 
-		type randResult struct {
+		type result struct {
 			bytes int64
 			err   error
 		}
-		done := make(chan randResult, 1)
+		done := make(chan result, 1)
 		t0 := time.Now()
 
 		go func() {
@@ -178,7 +138,7 @@ func randreadLoop(
 				}
 				b += drainMessage(msg)
 			}
-			done <- randResult{bytes: b, err: fetchCmd.Close()}
+			done <- result{bytes: b, err: fetchCmd.Close()}
 		}()
 
 		select {

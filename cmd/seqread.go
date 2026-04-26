@@ -2,7 +2,6 @@ package cmd
 
 import (
 	"context"
-	"fmt"
 	"io"
 	"log"
 	"os"
@@ -74,47 +73,24 @@ func runSeqread(cmd *cobra.Command, args []string) error {
 		return err
 	}
 
-	numUsers := len(boxes)
-	adjustedHalfLife := flagHalfLife * time.Duration(numUsers)
-	rl := bench.NewRateLimiter(adjustedHalfLife, flagThreshold)
 	m := bench.NewMetrics()
-
 	ctx, cancel := context.WithTimeout(context.Background(), flagDuration)
 	defer cancel()
 
-	if flagNoLimit {
-		fmt.Fprintf(os.Stdout, "seqread: host=%s users=%d concurrency=%d page-size=%d fetch=%s duration=%s (no rate limit)\n",
-			host, numUsers, flagConcurrency, flagPageSize, flagFetchMode, flagDuration)
-	} else {
-		fmt.Fprintf(os.Stdout, "seqread: host=%s users=%d concurrency=%d page-size=%d fetch=%s duration=%s target=%.2f/s\n",
-			host, numUsers, flagConcurrency, flagPageSize, flagFetchMode, flagDuration, rl.Rate()*float64(numUsers))
-	}
+	log.Printf("seqread: host=%s users=%d concurrency=%d page-size=%d fetch=%s duration=%s",
+		host, len(boxes), flagConcurrency, flagPageSize, flagFetchMode, flagDuration)
 
 	var wg sync.WaitGroup
-
 	for i := range boxes {
 		mb := boxes[i]
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			seqreadUserSession(ctx, cfg, mb, rl, m, flagConcurrency, flagPageSize, flagNoLimit, fetchOpts)
+			seqreadUserSession(ctx, cfg, mb, m, flagConcurrency, flagPageSize, fetchOpts)
 		}()
 	}
 
-	// Progress ticker
-	go func() {
-		ticker := time.NewTicker(5 * time.Second)
-		defer ticker.Stop()
-		prev := bench.ProgressState{Time: time.Now()}
-		for {
-			select {
-			case <-ctx.Done():
-				return
-			case <-ticker.C:
-				prev = m.PrintProgress(os.Stdout, prev)
-			}
-		}
-	}()
+	go progressTicker(ctx, m)
 
 	wg.Wait()
 	m.PrintSummary(os.Stdout)
@@ -125,10 +101,8 @@ func seqreadUserSession(
 	ctx context.Context,
 	cfg connConfig,
 	mb mailbox.Mailbox,
-	rl *bench.RateLimiter,
 	m *bench.Metrics,
 	concurrency, pageSize int,
-	noLimit bool,
 	fetchOpts *imap.FetchOptions,
 ) {
 	client, selectData, err := connectAndLogin(cfg, mb)
@@ -153,7 +127,7 @@ func seqreadUserSession(
 		innerWg.Add(1)
 		go func() {
 			defer innerWg.Done()
-			seqreadLoop(ctx, client, ps, rl, m, cfg.cmdTimeout, noLimit, fetchOpts)
+			seqreadLoop(ctx, client, ps, m, cfg.cmdTimeout, fetchOpts)
 		}()
 	}
 	innerWg.Wait()
@@ -169,25 +143,11 @@ func seqreadLoop(
 	ctx context.Context,
 	client *imapclient.Client,
 	ps *pageState,
-	rl *bench.RateLimiter,
 	m *bench.Metrics,
 	cmdTimeout time.Duration,
-	noLimit bool,
 	fetchOpts *imap.FetchOptions,
 ) {
 	for {
-		select {
-		case <-ctx.Done():
-			return
-		default:
-		}
-
-		if !noLimit {
-			if err := rl.Wait(ctx); err != nil {
-				return
-			}
-		}
-
 		select {
 		case <-ctx.Done():
 			return
