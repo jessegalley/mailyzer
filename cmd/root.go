@@ -187,9 +187,12 @@ func connectAndLogin(cfg connConfig, mb mailbox.Mailbox) (*imapclient.Client, *i
 	return client, selectData, nil
 }
 
-// closeClient logs out and closes the IMAP client connection.
+// closeClient closes the IMAP connection. We skip the graceful LOGOUT because
+// on a broken server Logout().Wait() blocks indefinitely, which would stall
+// the benchmark shutdown. Closing the TCP connection is sufficient — the server
+// will clean up the session, and any goroutine blocked inside a command will
+// get an immediate error from the closed connection.
 func closeClient(c *imapclient.Client) {
-	_ = c.Logout().Wait()
 	_ = c.Close()
 }
 
