@@ -73,7 +73,9 @@ func runSeqread(cmd *cobra.Command, args []string) error {
 		return err
 	}
 
-	m := bench.NewMetrics()
+	errWriter, closeErrLog := openErrLog()
+	defer closeErrLog()
+	m := bench.NewMetrics(errWriter)
 	ctx, cancel := context.WithTimeout(context.Background(), flagDuration)
 	defer cancel()
 
@@ -180,12 +182,12 @@ func seqreadLoop(
 		select {
 		case res := <-done:
 			if res.err != nil {
-				log.Printf("fetch error (seqread %d:%d): %v", startSeq, endSeq, res.err)
+				m.RecordError("fetch error (seqread %d:%d): %v", startSeq, endSeq, res.err)
 				return
 			}
 			m.RecordOp(time.Since(t0), res.n, res.bytes)
 		case <-time.After(cmdTimeout):
-			log.Printf("fetch timeout (seqread %d:%d)", startSeq, endSeq)
+			m.RecordError("fetch timeout (seqread %d:%d)", startSeq, endSeq)
 			return
 		case <-ctx.Done():
 			return

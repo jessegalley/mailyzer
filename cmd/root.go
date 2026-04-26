@@ -4,6 +4,8 @@ import (
 	"context"
 	"crypto/tls"
 	"fmt"
+	"io"
+	"log"
 	"os"
 	"time"
 
@@ -27,6 +29,8 @@ var (
 	flagConcurrency int
 	flagTimeout     time.Duration
 	flagFetchMode   string
+	flagMailbox     string
+	flagErrLog      string
 )
 
 var rootCmd = &cobra.Command{
@@ -54,6 +58,23 @@ func init() {
 	pf.IntVar(&flagConcurrency, "concurrency", 1, "goroutines per IMAP connection")
 	pf.DurationVar(&flagTimeout, "timeout", 30*time.Second, "per-command IMAP timeout")
 	pf.StringVar(&flagFetchMode, "fetch-mode", "all", "what to fetch per message: all, body, headers, envelope")
+	pf.StringVarP(&flagMailbox, "mailbox", "m", "INBOX", "mailbox to use for all operations")
+	pf.StringVar(&flagErrLog, "errlog", "", "write per-operation errors to this file (default: silent)")
+}
+
+// openErrLog opens flagErrLog for appending and returns the writer and a close
+// function. If flagErrLog is empty the writer is nil (errors are counted but
+// not logged). The caller must call close() when done.
+func openErrLog() (io.Writer, func()) {
+	if flagErrLog == "" {
+		return nil, func() {}
+	}
+	f, err := os.OpenFile(flagErrLog, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644)
+	if err != nil {
+		log.Printf("warning: cannot open errlog %q: %v (errors will be silent)", flagErrLog, err)
+		return nil, func() {}
+	}
+	return f, func() { f.Close() }
 }
 
 type connConfig struct {
@@ -111,44 +132,56 @@ func buildFetchOptions(mode string) (*imap.FetchOptions, error) {
 	}
 }
 
-// connectAndLogin dials the IMAP server, logs in with the given credentials,
-// and selects INBOX. The caller must call closeClient when done.
-func connectAndLogin(cfg connConfig, mb mailbox.Mailbox) (*imapclient.Client, *imap.SelectData, error) {
+// dialAndLogin dials the server and authenticates. It does NOT select a mailbox.
+// Used by the append command which doesn't need a selected mailbox.
+func dialAndLogin(cfg connConfig, mb mailbox.Mailbox) (*imapclient.Client, error) {
 	address := fmt.Sprintf("%s:%d", cfg.host, cfg.port)
 
-	var client *imapclient.Client
-	var err error
+	var (
+		client *imapclient.Client
+		err    error
+	)
 
 	if cfg.noTLS {
 		client, err = imapclient.DialInsecure(address, nil)
 		if err != nil {
-			return nil, nil, fmt.Errorf("dial %s: %w", address, err)
+			return nil, fmt.Errorf("dial %s: %w", address, err)
 		}
 	} else {
 		tlsCfg := &tls.Config{
 			InsecureSkipVerify: cfg.tlsSkipVerify, //nolint:gosec
 		}
-		opts := &imapclient.Options{TLSConfig: tlsCfg}
-		client, err = imapclient.DialTLS(address, opts)
+		client, err = imapclient.DialTLS(address, &imapclient.Options{TLSConfig: tlsCfg})
 		if err != nil {
-			return nil, nil, fmt.Errorf("dial TLS %s: %w", address, err)
+			return nil, fmt.Errorf("dial TLS %s: %w", address, err)
 		}
 	}
 
 	if err := client.WaitGreeting(); err != nil {
 		client.Close()
-		return nil, nil, fmt.Errorf("greeting from %s: %w", cfg.host, err)
+		return nil, fmt.Errorf("greeting from %s: %w", cfg.host, err)
 	}
 
 	if err := client.Login(mb.Username, mb.Password).Wait(); err != nil {
 		client.Close()
-		return nil, nil, fmt.Errorf("login %s: %w", mb.Username, err)
+		return nil, fmt.Errorf("login %s: %w", mb.Username, err)
 	}
 
-	selectData, err := client.Select("INBOX", nil).Wait()
+	return client, nil
+}
+
+// connectAndLogin dials the server, authenticates, and selects the configured mailbox.
+// The caller must call closeClient when done.
+func connectAndLogin(cfg connConfig, mb mailbox.Mailbox) (*imapclient.Client, *imap.SelectData, error) {
+	client, err := dialAndLogin(cfg, mb)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	selectData, err := client.Select(flagMailbox, nil).Wait()
 	if err != nil {
 		client.Close()
-		return nil, nil, fmt.Errorf("SELECT INBOX for %s: %w", mb.Username, err)
+		return nil, nil, fmt.Errorf("SELECT %s for %s: %w", flagMailbox, mb.Username, err)
 	}
 
 	return client, selectData, nil

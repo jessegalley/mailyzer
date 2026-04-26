@@ -3,6 +3,7 @@ package bench
 import (
 	"fmt"
 	"io"
+	"log"
 	"sort"
 	"sync"
 	"sync/atomic"
@@ -14,24 +15,40 @@ type Metrics struct {
 	startTime time.Time
 	count     atomic.Int64
 	bytes     atomic.Int64
+	errors    atomic.Int64
 	mu        sync.Mutex
 	latencies []time.Duration
+	errlog    *log.Logger // nil means errors are counted but not logged
 }
 
-// NewMetrics initializes a Metrics instance starting the clock now.
-func NewMetrics() *Metrics {
-	return &Metrics{startTime: time.Now()}
+// NewMetrics initializes a Metrics instance. If errWriter is non-nil, error
+// messages are written there in addition to being counted.
+func NewMetrics(errWriter io.Writer) *Metrics {
+	m := &Metrics{startTime: time.Now()}
+	if errWriter != nil {
+		m.errlog = log.New(errWriter, "", log.LstdFlags)
+	}
+	return m
 }
 
-// RecordOp records a completed IMAP fetch command. latency is the round-trip
-// duration of the command; n is the number of messages retrieved; b is the
-// total bytes of message body data read. One latency sample is stored per call.
+// RecordOp records a completed IMAP command. latency is the round-trip
+// duration; n is the number of messages; b is the total bytes transferred.
+// One latency sample is stored per call.
 func (m *Metrics) RecordOp(latency time.Duration, n, b int64) {
 	m.count.Add(n)
 	m.bytes.Add(b)
 	m.mu.Lock()
 	m.latencies = append(m.latencies, latency)
 	m.mu.Unlock()
+}
+
+// RecordError increments the error counter and, if an errlog is configured,
+// writes the formatted message there. It does not print to stdout/stderr.
+func (m *Metrics) RecordError(format string, args ...any) {
+	m.errors.Add(1)
+	if m.errlog != nil {
+		m.errlog.Printf(format, args...)
+	}
 }
 
 // Count returns the current total message count.
@@ -66,6 +83,7 @@ func (m *Metrics) PrintProgress(w io.Writer, prev ProgressState) ProgressState {
 	now := time.Now()
 	cur := m.count.Load()
 	curB := m.bytes.Load()
+	errs := m.errors.Load()
 	elapsed := now.Sub(m.startTime)
 	intervalSec := now.Sub(prev.Time).Seconds()
 
@@ -77,10 +95,16 @@ func (m *Metrics) PrintProgress(w io.Writer, prev ProgressState) ProgressState {
 	overallMsgRate := float64(cur) / elapsed.Seconds()
 	overallByteRate := float64(curB) / elapsed.Seconds()
 
-	fmt.Fprintf(w, "[%.1fs] msgs=%-8d  %.1f msg/s (recent %.1f)  %s/s (recent %s/s)\n",
+	errStr := ""
+	if errs > 0 {
+		errStr = fmt.Sprintf("  errs=%d", errs)
+	}
+
+	fmt.Fprintf(w, "[%.1fs] msgs=%-8d  %.1f msg/s (recent %.1f)  %s/s (recent %s/s)%s\n",
 		elapsed.Seconds(), cur,
 		overallMsgRate, recentMsgRate,
 		formatBytes(overallByteRate), formatBytes(recentByteRate),
+		errStr,
 	)
 	return ProgressState{Count: cur, Bytes: curB, Time: now}
 }
@@ -95,15 +119,16 @@ func (m *Metrics) PrintSummary(w io.Writer) {
 	elapsed := m.Elapsed()
 	cnt := m.Count()
 	rate := float64(cnt) / elapsed.Seconds()
-
 	totalBytes := m.bytes.Load()
 	byteRate := float64(totalBytes) / elapsed.Seconds()
+	errs := m.errors.Load()
 
 	fmt.Fprintf(w, "\n=== Benchmark Results ===\n")
 	fmt.Fprintf(w, "Duration:  %.3fs  Messages: %d  Rate: %.2f msg/s\n",
 		elapsed.Seconds(), cnt, rate)
 	fmt.Fprintf(w, "Data:      %s total  %s/s\n",
 		formatBytes(float64(totalBytes)), formatBytes(byteRate))
+	fmt.Fprintf(w, "Errors:    %d\n", errs)
 
 	if len(lats) == 0 {
 		fmt.Fprintln(w, "Latency:   no samples")

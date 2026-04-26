@@ -40,7 +40,9 @@ func runRandread(cmd *cobra.Command, args []string) error {
 		return err
 	}
 
-	m := bench.NewMetrics()
+	errWriter, closeErrLog := openErrLog()
+	defer closeErrLog()
+	m := bench.NewMetrics(errWriter)
 	ctx, cancel := context.WithTimeout(context.Background(), flagDuration)
 	defer cancel()
 
@@ -144,12 +146,12 @@ func randreadLoop(
 		select {
 		case res := <-done:
 			if res.err != nil {
-				log.Printf("fetch error (randread seq=%d): %v", seqNum, res.err)
+				m.RecordError("fetch error (randread seq=%d): %v", seqNum, res.err)
 				return
 			}
 			m.RecordOp(time.Since(t0), 1, res.bytes)
 		case <-time.After(cmdTimeout):
-			log.Printf("fetch timeout (randread seq=%d)", seqNum)
+			m.RecordError("fetch timeout (randread seq=%d)", seqNum)
 			return
 		case <-ctx.Done():
 			return
