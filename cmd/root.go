@@ -187,13 +187,15 @@ func connectAndLogin(cfg connConfig, mb mailbox.Mailbox) (*imapclient.Client, *i
 	return client, selectData, nil
 }
 
-// closeClient closes the IMAP connection. We skip the graceful LOGOUT because
-// on a broken server Logout().Wait() blocks indefinitely, which would stall
-// the benchmark shutdown. Closing the TCP connection is sufficient — the server
-// will clean up the session, and any goroutine blocked inside a command will
-// get an immediate error from the closed connection.
+// closeClient closes the IMAP connection. We fire-and-forget c.Close() due to
+// a bug in go-imap v2 beta.4: if a body-section literal is in-flight when the
+// connection closes, fetchLiteralReader.Read does not signal its internal done
+// channel on non-EOF errors (only on io.EOF), so the client's reader goroutine
+// blocks on <-done indefinitely, which in turn causes c.Close() to block on
+// <-c.decCh. The goroutine lives until process exit, which is fine for a CLI
+// benchmark tool.
 func closeClient(c *imapclient.Client) {
-	_ = c.Close()
+	go func() { _ = c.Close() }()
 }
 
 // progressTicker prints a progress line every 5 seconds until ctx is done.
